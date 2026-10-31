@@ -130,3 +130,15 @@ def authored_spec_toolless_verdict(agent: str, work_dir: Any = None) -> bool | N
         for candidate in agent_spec_candidates(directory, agent)
     )
     return False if present else None
+
+
+def sweep_kas_launch_snapshots(boot_time: float) -> None:
+    """Remove the KAS MCP launch snapshots last written a week before *boot_time*.
+
+    ``acp.kas_env_launch.sweep_stale``: the gateway's boot path starts it once,
+    on a background task, with the time it took after the previous run's agent
+    processes were ended. Blocking file I/O.
+    """
+    from kiro_crew.acp import kas_env_launch
+
+    kas_env_launch.sweep_stale(boot_time)
