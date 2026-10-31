@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Download,
   ExternalLink,
+  Loader2,
   Package,
   RefreshCw,
   ShieldCheck,
@@ -23,6 +24,7 @@ import { clearCachedModels } from '../providers/adapters/acp'
 import { safeGetItem, safeSetItem } from '../utils/safeStorage'
 import { Btn, Card, SendBtn } from './ui'
 import ErrorNotice from './ErrorNotice'
+import KasLoginGate from './KasLoginGate'
 import RelockNotice, { BARE_LOGIN_COMMAND } from './KiroPrerequisiteRelockNotice'
 import { KiroUnzipPrerequisite } from './KiroUnzipPrerequisite'
 import RemoteCrewSetupSkip from './RemoteCrewSetupSkip'
@@ -38,6 +40,16 @@ import {
 import { Trans } from 'react-i18next'
 import { i18nT } from '../i18n/t'
 const QUERY_KEY = ['kiro-prerequisite'] as const
+// The longest a sign-in-only gateway's hand-off to the real gateway may leave the
+// status unanswered: the rules fetch and sign-in refresh bound the start well
+// under this. Past it, the start failed.
+const SIGN_IN_HANDOFF_GRACE_MS = 120_000
+
+/** Whether a sign-in-only gateway's start has failed: the status poll is failing
+ *  and its last answer is older than the hand-off can take. */
+export function signInHandoffStopped(isError: boolean, lastAnswerAt: number, now: number): boolean {
+  return isError && now - lastAnswerAt > SIGN_IN_HANDOFF_GRACE_MS
+}
 
 export function kiroPrerequisiteRefetchInterval(
   status: KiroPrerequisiteStatus | undefined,
@@ -1582,6 +1594,40 @@ export default function KiroPrerequisiteGate({ children }: { children: ReactNode
     && statusQuery.error.status === 404
   ) {
     return app()
+  }
+  // Enterprise build, nobody signed in: the gateway is a sign-in-only app that
+  // serves Crew's own sign-in and nothing else. Once a sign-in lands it boots for
+  // real, and the next status read comes from that gateway.
+  if (prerequisite?.enterprise_sign_in_only === true) {
+    const starting = i18nT('components.kiroPrerequisiteGate.your_crew_is_almost_ready')
+    const aside = i18nT('components.kiroPrerequisiteGate.enterprise_sign_in_aside')
+    // After sign-in the gateway hands its port to the real one, which loads the
+    // rules first; the status poll fails until it answers. A gap longer than any
+    // start can take means the start failed and the process exited.
+    const stopped = signInHandoffStopped(statusQuery.isError, statusQuery.dataUpdatedAt, Date.now())
+    return (
+      <KasLoginGate organisationOnly>
+        <SetupShell asideHeadline={starting} asideBody={aside}>
+          {stopped ? (
+            <div role="alert" data-testid="enterprise-gateway-stopped">
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-accent-subtle text-accent">
+                <AlertTriangle className="lucide-inline" />
+              </div>
+              <h1 className="mt-6 text-3xl font-bold tracking-tight text-text-strong">
+                {i18nT('components.kiroPrerequisiteGate.enterprise_gateway_stopped_title')}
+              </h1>
+              <p className="mt-3 max-w-lg text-sm leading-relaxed text-muted">
+                {i18nT('components.kiroPrerequisiteGate.enterprise_gateway_stopped_body')}
+              </p>
+            </div>
+          ) : (
+            <div role="status" aria-label={starting} className="flex justify-center">
+              <Loader2 className="h-6 w-6 animate-spin text-muted" aria-hidden="true" />
+            </div>
+          )}
+        </SetupShell>
+      </KasLoginGate>
+    )
   }
   // No usable status: either a live gateway error or an unusable body. Both are
   // "we cannot tell". A RETURNING user keeps their dashboard, fully usable —
