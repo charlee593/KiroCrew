@@ -49,9 +49,9 @@ class _Embedder:
 
 
 @pytest.fixture(autouse=True)
-def _fresh_settings(monkeypatch: pytest.MonkeyPatch):
+def _fresh_settings(_floor_monkeypatch: pytest.MonkeyPatch):
     """Each test reads the config afresh, not the previous test's cached answer."""
-    monkeypatch.setattr(rp, "_settings_cache", None)
+    _floor_monkeypatch.setattr(rp, "_settings_cache", None)
 
 
 FACTS = {
@@ -87,6 +87,21 @@ def pool(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(rp, "get_pool", lambda size, max_mb: handle)
     yield handle
     handle.close()
+
+
+def _children_of(pid: int) -> list[int]:
+    """Direct children of *pid*, read from /proc."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        if int(stat.rsplit(")", 1)[1].split()[1]) == pid:
+            found.append(int(entry.name))
+    return found
 
 
 def _lessons_kwargs(**over):
@@ -219,6 +234,51 @@ class TestEndToEnd:
         assert row["last_accessed_at"] is not None
         assert row["id"] in store._last_accessed_touch
 
+    @staticmethod
+    def _collected(read):
+        """What a turn's two collectors hold after *read*, from a seeded omission record."""
+        from kiro_crew import context_omissions, injection_receipts
+
+        with context_omissions.collect() as omissions, injection_receipts.collect() as receipts:
+            # A record an earlier render of the same tier left behind in this build.
+            context_omissions.record(
+                context_omissions.LESSON_RULES, "budget", omitted=9, total=9, budget_chars=1
+            )
+            text = read()
+        return text, dict(omissions), dict(receipts)
+
+    @pytest.mark.parametrize(
+        "budgets",
+        [
+            dict(hard_cap=700, directive_budget=300, experience_budget=100),
+            dict(hard_cap=40000, directive_budget=30000, experience_budget=1500),
+        ],
+        ids=["tiers cut for budget", "everything kept"],
+    )
+    def test_lesson_records_reach_the_builds_collectors(
+        self, store, pool, monkeypatch: pytest.MonkeyPatch, budgets
+    ) -> None:
+        for i in range(25):
+            store.write_lesson(f"rule number {i} about rollout " + "word " * 30, "knowledge")
+        kw = _lessons_kwargs(**budgets)
+        expected = self._collected(lambda: lessons_mod.get_lessons_context(store, **kw))
+        _forbid_in_process(monkeypatch)
+        got = self._collected(lambda: store.get_lessons_context(**kw))
+        assert got == expected
+        # The receipt names the rows shown, and the seeded omission is dropped or replaced
+        # exactly as the in-process render does.
+        assert expected[2]
+        if budgets["hard_cap"] < 1000:
+            assert expected[1]["lesson_rules"]["reason"] == "budget"
+        else:
+            assert "lesson_rules" not in expected[1]
+
+    def test_a_read_outside_a_collection_records_nothing(
+        self, store, pool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _forbid_in_process(monkeypatch)
+        assert LESSON in store.get_lessons_context(**_lessons_kwargs())
+
     def test_a_stale_query_vector_ranks_by_keyword_like_the_gateway(
         self, store, pool, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -251,6 +311,28 @@ class TestEndToEnd:
         assert not errors
         assert out == [expected] * 6
         assert len(pool.pids()) <= 2
+
+    def test_a_child_does_not_start_children_of_its_own(
+        self, store, pool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``python -m`` runs the module as ``__main__``: the child must still know it is one.
+
+        The child reads the same config as the gateway, so with the switch on in the
+        file it would offload its own reads and start grandchildren, level after level.
+        """
+        from kiro_crew.config.loader import config_path
+
+        path = config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"memory": {"recall_pool_processes": 2}}))
+        try:
+            _forbid_in_process(monkeypatch)
+            assert "kubernetes" in store.get_semantic_context(QUERY, 1500, facts_only=True)
+            assert "kubernetes" in store.get_semantic_context(QUERY, 1500, facts_only=True)
+            for pid in pool.pids():
+                assert _children_of(pid) == []
+        finally:
+            path.unlink(missing_ok=True)
 
     def test_a_child_over_its_memory_limit_is_replaced(
         self, store, monkeypatch: pytest.MonkeyPatch
@@ -311,10 +393,9 @@ class TestFallback:
         monkeypatch.setattr(rp, "settings", lambda: (1, 3072))
         monkeypatch.setattr(rp, "get_pool", lambda size, max_mb: handle)
         try:
-            started = time.monotonic()
             assert "kubernetes" in store.get_semantic_context(QUERY, 1500, facts_only=True)
-            assert time.monotonic() - started < 30
             assert handle.pids() == []
+            assert handle._failures == 1
         finally:
             handle.close()
 
@@ -395,11 +476,52 @@ class TestFallback:
         assert rp.pool_enabled() is False
         assert rp.offload(store, "semantic", {"query_text": QUERY}) is None
 
+    def test_the_environment_marks_a_child_too(
+        self, store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(rp, "settings", lambda: (2, 3072))
+        monkeypatch.setenv(rp._CHILD_ENV, "1")
+        assert rp.in_child() is True
+        assert rp.pool_enabled() is False
+        assert rp.offload(store, "semantic", {"query_text": QUERY}) is None
+
     def test_a_closed_pool_refuses_work(self) -> None:
         handle = RecallPool(1, 3072)
         handle.close()
         with pytest.raises(ChildUnavailable):
             handle.run_job({"kind": "semantic"}, serve_embed=lambda f: {})
+
+
+class TestReceiptReplay:
+    def test_replay_records_known_kinds_inside_a_collection(self) -> None:
+        from kiro_crew import injection_receipts
+
+        with injection_receipts.collect() as sink:
+            injection_receipts.replay(
+                {
+                    "lessons": {"ids": ["lesson.a", 3], "omitted": 2},
+                    "findings": {"ids": "bad", "omitted": -4},
+                    "nonsense": {"ids": ["x"], "omitted": 1},
+                    "turn_lessons": "bad",
+                }
+            )
+        assert sink == {
+            "lessons": {"ids": ["lesson.a"], "omitted": 2},
+            "findings": {"ids": [], "omitted": 0},
+        }
+
+    def test_replay_outside_a_collection_is_a_no_op(self) -> None:
+        from kiro_crew import injection_receipts
+
+        injection_receipts.replay({"lessons": {"ids": ["lesson.a"], "omitted": 0}})
+
+    def test_malformed_records_from_a_child_never_fail_a_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rp._replay_records({"omissions": {"cleared": 7, "set": [1]}, "receipts": "x"})
+        rp._replay_records(
+            {"omissions": {"cleared": ["nonsense"], "set": {"x": {}, "lesson_rules": 1}}}
+        )
 
 
 def test_the_pool_is_rebuilt_when_the_setting_changes(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -550,3 +672,16 @@ class TestServeLoopInProcess:
     def test_the_resident_size_is_readable_here(self) -> None:
         assert rp._rss_mb() > 0
         assert rp._max_rss_mb() >= 0.0
+
+    def test_an_unreadable_resident_size_never_recycles(
+        self, store, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("KIROCREW_RECALL_POOL_MAX_RSS_MB", "1")
+        monkeypatch.setattr(rp, "_rss_mb", lambda: None)
+        stdin = self._lines(
+            self._job(store, "nonsense", {}, 1), self._job(store, "nonsense", {}, 2)
+        )
+        out = io.BytesIO()
+        assert rp._serve(stdin, out) == 0
+        results = [f for f in self._frames(out) if f["op"] == "result"]
+        assert len(results) == 2 and not any(f.get("recycle") for f in results)

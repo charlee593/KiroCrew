@@ -111,6 +111,10 @@ _BACKOFF_CAP_SECS = 300.0
 MAX_POOL_PROCESSES = 8
 
 _IN_CHILD = False
+#: Set in the environment of every child. ``python -m`` runs this file as ``__main__``, so a
+#: flag set by ``main()`` would live on that copy and not on the ``kiro_crew.recall_pool``
+#: the store methods import; the environment reaches both.
+_CHILD_ENV = "KIROCREW_RECALL_POOL_CHILD"
 
 #: The reads a child answers, keyed by the ``kind`` of the job.
 KINDS = ("semantic", "episodic", "lessons")
@@ -118,7 +122,7 @@ KINDS = ("semantic", "episodic", "lessons")
 
 def in_child() -> bool:
     """Whether this process is a pool child (which must never offload again)."""
-    return _IN_CHILD
+    return _IN_CHILD or os.environ.get(_CHILD_ENV) == "1"
 
 
 # ── gateway side ──
@@ -187,9 +191,11 @@ class RecallPool:
         # -P: never put the working directory on the child's sys.path, so a
         # kiro_crew/ directory in the gateway's cwd cannot shadow the package.
         argv = self._argv or platform_compat.isolated_python_argv("-P", "-m", _CHILD_MODULE)
-        env = self._env
-        if env is None:
-            env = {**os.environ, "KIROCREW_RECALL_POOL_MAX_RSS_MB": str(self.max_rss_mb)}
+        env = {
+            **(os.environ if self._env is None else self._env),
+            _CHILD_ENV: "1",
+            "KIROCREW_RECALL_POOL_MAX_RSS_MB": str(self.max_rss_mb),
+        }
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, this interpreter
             argv,
             stdin=subprocess.PIPE,
@@ -409,7 +415,7 @@ def _read_settings() -> tuple[int, int]:
 
 def pool_enabled() -> bool:
     """Whether recall reads may go to the children (not in a child, switch on)."""
-    return not _IN_CHILD and settings()[0] >= 1
+    return not in_child() and settings()[0] >= 1
 
 
 def get_pool(size: int, max_rss_mb: int) -> RecallPool:
@@ -465,7 +471,7 @@ def offload(store: Any, kind: str, args: dict[str, Any]) -> str | None:
     ``None`` is the answer whenever the pool is off, the store is not one a child can
     open, or the child could not finish: the caller then runs the same method itself.
     """
-    if _IN_CHILD or kind not in KINDS:
+    if in_child() or kind not in KINDS:
         return None
     processes, max_mb = settings()
     if processes < 1:
@@ -498,6 +504,7 @@ def offload(store: Any, kind: str, args: dict[str, Any]) -> str | None:
             frame.get("message"),
         )
         return None
+    _replay_records(frame)
     touched = frame.get("touched")
     if isinstance(touched, list) and touched:
         try:
@@ -506,6 +513,37 @@ def offload(store: Any, kind: str, args: dict[str, Any]) -> str | None:
             logger.debug("Could not record episodic access", exc_info=True)
     text = frame.get("text")
     return text if isinstance(text, str) else None
+
+
+def _replay_records(frame: dict[str, Any]) -> None:
+    """Hand the per-turn collectors of this build what the child's read recorded.
+
+    The lesson renderers write an omission record and an injection receipt into
+    ContextVar collectors that the turn opened; those do not cross a process, so the
+    child gathers them and this puts them where the in-process read would have.
+    """
+    from kiro_crew import context_omissions, injection_receipts
+
+    try:
+        omissions = frame.get("omissions")
+        if isinstance(omissions, dict):
+            for kind in omissions.get("cleared") or ():
+                if kind in context_omissions.KINDS:
+                    context_omissions.clear(kind)
+            recorded = omissions.get("set")
+            if isinstance(recorded, dict):
+                context_omissions.replay(
+                    {
+                        k: v
+                        for k, v in recorded.items()
+                        if k in context_omissions.KINDS and isinstance(v, dict)
+                    }
+                )
+        receipts = frame.get("receipts")
+        if isinstance(receipts, dict):
+            injection_receipts.replay(receipts)
+    except Exception:  # noqa: BLE001 - telemetry never fails a recall
+        logger.debug("Could not replay a recall child's records", exc_info=True)
 
 
 def lessons_args(
@@ -557,21 +595,11 @@ def lessons_args(
 
 
 def _rss_mb() -> float | None:
-    """This process's resident set in MB, or ``None`` where it cannot be read."""
-    try:
-        with open("/proc/self/status", encoding="ascii") as fh:
-            for line in fh:
-                if line.startswith("VmRSS:"):
-                    return int(line.split()[1]) / 1024.0
-    except (OSError, ValueError, IndexError):
-        pass
-    try:
-        import resource
+    """This process's current resident set in MB, or ``None`` where it cannot be read."""
+    from kiro_crew import platform_compat
 
-        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        return peak / (1024.0 * 1024.0) if sys.platform == "darwin" else peak / 1024.0
-    except (ImportError, OSError, ValueError):
-        return None
+    rss = platform_compat.proc_rss_bytes()
+    return rss / (1024.0 * 1024.0) if rss > 0 else None
 
 
 class _RecallState(_ChildState):
@@ -599,7 +627,30 @@ def _prepare(state: _ChildState, job: dict[str, Any]) -> tuple[Any, list[str]]:
     return store, touched
 
 
+#: Marks a kind the read has not touched: ``record`` and ``clear`` both replace or drop
+#: the entry, so an entry still ``is`` its seed was left alone and one that is gone was cleared.
+_OMISSION_SEED: dict[str, Any] = {}
+_RECEIPT_SEED: dict[str, Any] = {}
+
+
 def _run_job(state: _ChildState, job: dict[str, Any]) -> dict[str, Any]:
+    """Run one read under the two per-turn collectors and return its text and their records."""
+    from kiro_crew import context_omissions, injection_receipts
+
+    with context_omissions.collect() as omissions, injection_receipts.collect() as receipts:
+        omissions.update({k: _OMISSION_SEED for k in context_omissions.KINDS})
+        receipts.update({k: _RECEIPT_SEED for k in injection_receipts.KINDS})
+        reply = _read(state, job)
+    if reply.get("ok"):
+        reply["omissions"] = {
+            "set": {k: v for k, v in omissions.items() if v is not _OMISSION_SEED},
+            "cleared": [k for k in context_omissions.KINDS if k not in omissions],
+        }
+        reply["receipts"] = {k: v for k, v in receipts.items() if v is not _RECEIPT_SEED}
+    return reply
+
+
+def _read(state: _ChildState, job: dict[str, Any]) -> dict[str, Any]:
     from kiro_crew.vector_memory_runtime.embedding import _RecallQuery
 
     store, touched = _prepare(state, job)
@@ -652,6 +703,7 @@ def main() -> int:
     """Child entry: answer recall jobs from stdin until EOF or the gateway goes away."""
     global _IN_CHILD
     _IN_CHILD = True
+    os.environ[_CHILD_ENV] = "1"
     # The protocol owns the original stdout; anything else that prints goes to stderr.
     out = os.fdopen(os.dup(1), "wb")
     try:
