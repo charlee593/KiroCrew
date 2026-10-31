@@ -893,9 +893,11 @@ def _iter_visible(
 
     ``_owning_app`` resolves real paths, so filtering the whole catalog costs a few
     ``realpath`` walks per skill, and context assembly asks several times a turn.
-    ``_iter`` hands back the SAME cached list until the catalog is rebuilt, and an
-    app skill's owner follows from its path, so the filtered rows are kept against
-    that list object and the disabled set and reused while both are unchanged.
+    ``_iter`` hands back the SAME cached list until the catalog is rebuilt, so the
+    filtered rows are kept against that list object and the disabled set and reused
+    while both are unchanged. A flat skill can also name its app in an ``app:``
+    frontmatter line; an out-of-band edit of that line is seen when the catalog
+    next revalidates (``_CATALOG_REVALIDATE_AFTER_SECS``) and publishes a new list.
     """
     disabled_apps = loader._get_disabled_app_names()
     rows = loader._iter(project_dir)
