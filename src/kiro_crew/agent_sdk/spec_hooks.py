@@ -115,6 +115,26 @@ _HOOKS_CONCERN = "hooks"
 #: were skipped (the session-start notice names the count).
 _cache: dict[tuple[str, str], tuple[tuple[ScriptHook, ...], int]] = {}
 
+#: The origin tag a user standalone-hook-file hook carries, distinct from a spec
+#: hook's ``project`` / ``user`` origin, so a reader can tell a ``~/.kiro/hooks``
+#: file hook apart from an agent spec's own ``hooks`` field.
+_USER_FILE_ORIGIN = "user_file"
+
+#: Bound on a single standalone hook file read, so a large or runaway file cannot
+#: be slurped whole. A v1 hook file is a small JSON object; 256 KiB is far above
+#: any real one and still refuses a pathological file.
+_MAX_HOOK_FILE_BYTES = 256 * 1024
+
+#: Bound on the standalone hook files scanned in one directory, so a directory
+#: packed with files cannot make session start walk without limit. The per-file
+#: document cap and ``_MAX_SPEC_HOOKS`` still bound what actually fires.
+_MAX_HOOK_FILES = 64
+
+#: Per standalone hook FILE: the converted hooks keyed by (path, content digest),
+#: so an unchanged file is converted -- and its skipped documents audited -- once
+#: rather than on every turn. Bounded like :data:`_cache`.
+_user_file_cache: dict[tuple[str, str], tuple[ScriptHook, ...]] = {}
+
 
 def _diagnostic(value: object) -> str:
     """A spec-supplied value for a log line: escaped, then redacted."""
@@ -387,6 +407,157 @@ def spec_script_hooks(agent_id: str, spec: dict[str, Any]) -> list[ScriptHook]:
     docstring); anything else is warned about, audited once, and yields nothing.
     """
     return list(_convert(agent_id, spec)[0])
+
+
+def project_hook_files_present(project_dir: str | None) -> bool:
+    """Whether the session's checkout has standalone ``<project>/.kiro/hooks/*.json``.
+
+    These files do NOT run in a dashboard KAS session: a project hook is a command
+    from a checkout, gated on the trust verdict Crew cannot read
+    (:func:`kiro_crew.acp.session_mcp._project_mcp_trusted`). This only reports that
+    such files exist, so a session-start notice can say they are withheld rather
+    than let them fail silently -- the same shape as the withheld project spec
+    hooks notice. Best-effort: any read error answers ``False`` (no notice) rather
+    than failing the turn.
+    """
+    if not project_dir:
+        return False
+    try:
+        hooks_dir = Path(project_dir) / ".kiro" / "hooks"
+        return any(p.is_file() for p in hooks_dir.glob("*.json"))
+    except OSError:
+        return False
+
+
+def _user_hooks_dir() -> Path | None:
+    """The directory standalone user hook files are read from, or ``None``.
+
+    ``agent.kiro_hooks_dir`` in ``~/.kiro/crew/config.json`` (default
+    ``~/.kiro/hooks``), resolved and required to live under the user's HOME and
+    outside a sensitive directory -- the same containment the ``~/.kiro/hooks``
+    script autoimport applies (:func:`kiro_crew.agent_materialization.kiro_hooks`).
+    An unresolvable or out-of-HOME setting answers ``None`` (fail closed), never
+    an unchecked path. The user's own files need no per-workspace trust gate,
+    the way project files do: this is the user's HOME, not a checkout.
+    """
+    # Deferred import: ``agent`` imports ``hooks``, which this module imports at
+    # load time, so resolving the dir at call time avoids the import cycle.
+    from kiro_crew import agent as agent_mod
+
+    try:
+        return agent_mod.resolved_kiro_hooks_dir()
+    except Exception:  # noqa: BLE001 - a missing dir must never fail the turn
+        logger.debug("user hook files: could not resolve the hooks directory", exc_info=True)
+        return None
+
+
+def _hook_file_bytes(path: Path, within_root: Path) -> bytes | None:
+    """Bytes of one hook file, read symlink- and containment-safe, or ``None``.
+
+    Reads through :func:`kiro_crew.hooks.safe_read_file_bytes_nolink` pinned to
+    *within_root* and :data:`_MAX_HOOK_FILE_BYTES`: a symlink at the final
+    component, a hardlinked inode, a non-regular file, a target escaping the hooks
+    directory, a sensitive path, or an oversized file is refused and read as
+    ``None``. So a ``*.json`` entry that is a link to a credential file is never
+    read as a hook file. A read failure degrades to ``None`` rather than raising.
+    """
+    from kiro_crew.hooks import safe_read_file_bytes_nolink
+
+    try:
+        return safe_read_file_bytes_nolink(
+            str(path), str(within_root), max_bytes=_MAX_HOOK_FILE_BYTES
+        )
+    except Exception:  # noqa: BLE001 - a hand-placed file must never fail a turn
+        logger.debug("user hook file %s could not be read safely", _diagnostic(str(path)))
+        return None
+
+
+def _hook_documents_from_bytes(path: Path, raw: bytes) -> list | None:
+    """The ``hooks`` array of one v1 hook file's bytes, or ``None`` for none.
+
+    A JSON error, a non-object top level, or a ``hooks`` that is not a list skips
+    the file with one log line rather than raising. The ``version`` field is not
+    required: the document validator downstream accepts or rejects each entry.
+    """
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        logger.info("user hook file %s is not valid JSON, skipping", _diagnostic(str(path)))
+        return None
+    if not isinstance(data, dict):
+        logger.info("user hook file %s is not a JSON object, skipping", _diagnostic(str(path)))
+        return None
+    hooks = data.get("hooks")
+    if not isinstance(hooks, list) or not hooks:
+        return None
+    return hooks
+
+
+def user_hook_files() -> list[ScriptHook]:
+    """The user's standalone ``~/.kiro/hooks/*.json`` hooks, as script hooks.
+
+    These v1 files are what ``kiro-cli chat --agent-engine v3`` runs. Each file's
+    ``hooks`` array is converted through the SAME document path a spec's array form
+    uses (:func:`_from_documents`): only ``action.type == "command"`` documents on
+    a known trigger (SessionStart/AgentSpawn, UserPromptSubmit, PreToolUse,
+    PostToolUse, Stop) become hooks; an ``agent`` action, an unknown trigger, a
+    disabled or ``confirm: true`` document, or a malformed entry is skipped and
+    logged once, never guessed. The returned hooks ride the turn's ``extra_hooks``
+    so they meet exactly the gates a Hooks-page hook meets -- the shell deny list,
+    the SEL audit, ``capabilities.script_hooks`` and the PreToolUse exit-2 block.
+
+    Only the USER directory is read, symlink- and containment-safe. Project
+    ``<project>/.kiro/hooks/*.json`` are not read here; they stay off on the trust
+    verdict Crew cannot read for a checkout
+    (:func:`kiro_crew.acp.session_mcp._project_mcp_trusted`). The total is bounded
+    by :data:`_MAX_SPEC_HOOKS`, the same cap a spec's hooks share.
+
+    Each file's conversion is cached by its path and content digest, so an
+    unchanged file is converted -- and its skipped documents audited -- once rather
+    than on every turn. Never raises: a missing directory, or an unreadable or
+    malformed file, degrades to fewer hooks rather than a failed turn.
+    """
+    hooks_dir = _user_hooks_dir()
+    if hooks_dir is None:
+        return []
+    try:
+        files = sorted(p for p in hooks_dir.glob("*.json") if p.is_file())
+    except OSError:
+        logger.debug("user hook files: could not list %s", _diagnostic(str(hooks_dir)))
+        return []
+    out: list[ScriptHook] = []
+    for path in files[:_MAX_HOOK_FILES]:
+        if len(out) >= _MAX_SPEC_HOOKS:
+            break
+        raw = _hook_file_bytes(path, hooks_dir)
+        if raw is None:
+            continue
+        digest = hashlib.sha256(raw).hexdigest()
+        key = (str(path), digest)
+        cached = _user_file_cache.get(key)
+        if cached is None:
+            documents = _hook_documents_from_bytes(path, raw)
+            if not documents:
+                converted: tuple[ScriptHook, ...] = ()
+            else:
+                # The file's stem identifies the hooks in logs and ids;
+                # ``_from_documents`` runs the same command/trigger/action
+                # screening a spec array gets, so an unknown action or trigger is
+                # skipped there, not here.
+                agent_id = f"userfile:{path.stem}"
+                converted = tuple(
+                    dataclasses.replace(h, spec_origin=_USER_FILE_ORIGIN)
+                    for h in _from_documents(agent_id, documents, [])
+                )
+            if len(_user_file_cache) >= _CACHE_MAX:
+                _user_file_cache.clear()
+            _user_file_cache[key] = converted
+            cached = converted
+        for hook in cached:
+            if len(out) >= _MAX_SPEC_HOOKS:
+                break
+            out.append(hook)
+    return out
 
 
 def _convert(agent_id: str, spec: dict[str, Any]) -> tuple[tuple[ScriptHook, ...], int]:
