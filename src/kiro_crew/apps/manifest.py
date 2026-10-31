@@ -61,6 +61,8 @@ from kiro_crew.apps.manifest_contributes import (  # noqa: F401
     MAX_LINK_PREVIEW_TEXT_PATTERN_LEN,
     MAX_LINK_PREVIEW_TEXT_PATTERNS,
     MAX_LINK_PREVIEWS_PER_APP,
+    MAX_MESSAGE_ACTION_CHARS,
+    MAX_MESSAGE_ACTIONS_PER_APP,
     MAX_SESSION_CONTROLS_PER_APP,
     CommandArgument,
     CommandContribution,
@@ -68,6 +70,7 @@ from kiro_crew.apps.manifest_contributes import (  # noqa: F401
     FileMenuItemConfig,
     FileMenuWhen,
     LinkPreviewConfig,
+    MessageActionConfig,
     PanelTabConfig,
     SessionControlContribution,
     _mirrored_len,
@@ -514,6 +517,13 @@ class AppManifest:
             refusal = path_refusal(preview.entry)
             if refusal:
                 report_path(refusal, f"contributes.linkPreviews entry {refusal}: {preview.entry!r}")
+        # A message-action entry is imported by the same frame bootstrap.
+        for action in self.contributes.messageActions:
+            refusal = path_refusal(action.entry)
+            if refusal:
+                report_path(
+                    refusal, f"contributes.messageActions entry {refusal}: {action.entry!r}"
+                )
 
         # UI page validation
         for page in self.ui.pages:
@@ -748,6 +758,8 @@ class AppManifest:
             # A link-preview `entry` is an ESM module the dashboard imports and runs
             # in its own origin, like a panel tab's: same reason to sign it.
             or self.contributes.linkPreviews
+            # A message action's roles and format decide which text the app is handed.
+            or self.contributes.messageActions
         ):
             # A contributed command's `prompt` is sent to an agent with tools as if
             # the reader typed it, and `autoSend` fires it without a further
